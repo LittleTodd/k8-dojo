@@ -130,6 +130,11 @@ func (m *ProgressModel) SetSteps(steps []ProgressStep) {
 	m.steps = steps
 }
 
+// GetSteps returns the progress steps.
+func (m *ProgressModel) GetSteps() []ProgressStep {
+	return m.steps
+}
+
 // SetWidth sets the width.
 func (m *ProgressModel) SetWidth(width int) {
 	m.width = width

@@ -57,8 +57,10 @@ type AppModel struct {
 	selectedVersion int
 
 	// Bootstrap
-	bootstrap    components.ProgressModel
-	bootstrapErr error
+	bootstrap         components.ProgressModel
+	bootstrapErr      error
+	bootstrapRealDone bool
+	bootstrapStep     int
 
 	// Components
 	header    components.HeaderModel
@@ -117,6 +119,9 @@ type checkResultMsg struct {
 }
 
 type tickMsg time.Time
+
+type progressTickMsg time.Time
+type finalDelayMsg time.Time
 
 // NewAppModel creates a new TUI model with the enhanced architecture.
 func NewAppModel() AppModel {
@@ -214,6 +219,47 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.checkScenario()
 		}
 
+	case progressTickMsg:
+		if m.view == ViewBootstrap {
+			steps := m.bootstrap.GetSteps()
+
+			// If we are past the last step, check if we can finish
+			if m.bootstrapStep >= len(steps) {
+				if m.bootstrapRealDone {
+					return m, tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+						return finalDelayMsg(t)
+					})
+				}
+				// Waiting for real job to finish...
+				m.bootstrap.SetSubtitle("Finalizing cluster setup...")
+				return m, nil
+			}
+
+			// Advance step
+			// Mark current step complete (if not the first run)
+			if m.bootstrapStep > 0 && m.bootstrapStep-1 < len(steps) {
+				steps[m.bootstrapStep-1].Complete = true
+				steps[m.bootstrapStep-1].Active = false
+			}
+
+			// Mark next step active
+			if m.bootstrapStep < len(steps) {
+				steps[m.bootstrapStep].Active = true
+			}
+
+			m.bootstrap.SetSteps(steps)
+
+			// Smooth progress increment
+			pct := float64(m.bootstrapStep+1) * (1.0 / float64(len(steps)+1))
+			m.bootstrap.SetPercent(pct)
+
+			m.bootstrapStep++
+			return m, m.tickProgress()
+		}
+
+	case finalDelayMsg:
+		return m.finalizeBootstrap()
+
 	case components.TerminalOutputMsg:
 		// Terminal has new output, just return to trigger re-render
 		return m, nil
@@ -289,11 +335,38 @@ func (m AppModel) handleBootstrapDone(msg bootstrapDoneMsg) (tea.Model, tea.Cmd)
 	// Set header version
 	m.header.SetVersion(m.versions[m.selectedVersion].Version)
 
+	// Mark bootstrap as finished
+	m.bootstrapRealDone = true
+
+	// Check if animation is already checking for us
+	// We do verify explicitly here in case animation ended long ago
+	steps := m.bootstrap.GetSteps()
+	if m.bootstrapStep >= len(steps) {
+		// Animation finished waiting, trigger completion
+		m.bootstrap.SetSubtitle("Cluster ready!")
+
+		// Ensure visual 100% just in case
+		for i := range steps {
+			steps[i].Complete = true
+			steps[i].Active = false
+		}
+		m.bootstrap.SetSteps(steps)
+		m.bootstrap.SetPercent(1.0)
+
+		return m, tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+			return finalDelayMsg(t)
+		})
+	}
+
+	// If animation is still running, do nothing. It will catch m.bootstrapRealDone flag.
+	return m, nil
+}
+
+func (m AppModel) finalizeBootstrap() (tea.Model, tea.Cmd) {
 	// Switch to dashboard view
 	m.view = ViewDashboard
 	m.focus = FocusSidebar
 	m.updateFocusStyles()
-
 	return m, nil
 }
 
@@ -397,8 +470,12 @@ func (m AppModel) updateVersionSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 				{Label: "Starting control plane", Complete: false},
 				{Label: "Configuring kubeconfig", Complete: false},
 			})
-			m.bootstrap.SetPercent(0.2)
-			return m, m.doBootstrap()
+			m.bootstrap.SetPercent(0.1)
+			m.bootstrapStep = 0 // Start from beginning
+			return m, tea.Batch(
+				m.doBootstrap(),
+				m.tickProgress(),
+			)
 		}
 	}
 	return m, nil
@@ -613,6 +690,12 @@ func (m AppModel) checkScenario() tea.Cmd {
 		}
 		return checkResultMsg{result: result}
 	}
+}
+
+func (m AppModel) tickProgress() tea.Cmd {
+	return tea.Tick(800*time.Millisecond, func(t time.Time) tea.Msg {
+		return progressTickMsg(t)
+	})
 }
 
 func (m AppModel) cleanup() tea.Cmd {
