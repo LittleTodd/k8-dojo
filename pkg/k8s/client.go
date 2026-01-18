@@ -24,6 +24,10 @@ func NewClientFromKubeconfig(kubeconfig string) (*Client, error) {
 	}
 
 	// Create clientset
+	// Increase rate limits to prevent "client-side throttling" logs and UI lag
+	config.QPS = 50.0
+	config.Burst = 100
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create clientset: %w", err)

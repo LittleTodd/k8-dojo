@@ -18,6 +18,7 @@ type SuccessModel struct {
 	width        int
 	height       int
 	styles       SuccessStyles
+	selectedBtn  int // 0: Continue, 1: Retry
 }
 
 // SuccessStyles contains styles for the success screen.
@@ -114,6 +115,21 @@ func (m *SuccessModel) SetSize(width, height int) {
 	m.height = height
 }
 
+// NextButton selects the next button.
+func (m *SuccessModel) NextButton() {
+	m.selectedBtn = (m.selectedBtn + 1) % 2
+}
+
+// PrevButton selects the previous button.
+func (m *SuccessModel) PrevButton() {
+	m.selectedBtn = (m.selectedBtn - 1 + 2) % 2
+}
+
+// SelectedButton returns the index of the selected button (0: Continue, 1: Retry).
+func (m *SuccessModel) SelectedButton() int {
+	return m.selectedBtn
+}
+
 // View renders the success screen.
 func (m SuccessModel) View() string {
 	var b strings.Builder
@@ -128,8 +144,17 @@ func (m SuccessModel) View() string {
 	b.WriteString("\n\n")
 
 	// Action buttons
-	continueBtn := m.styles.Button.Render(" Continue ")
-	retryBtn := m.styles.Muted.Render("[ Retry ]")
+	continueBtn := " Continue "
+	retryBtn := "  Retry   "
+
+	if m.selectedBtn == 0 {
+		continueBtn = m.styles.Button.Render(continueBtn)
+		retryBtn = m.styles.Muted.Render(retryBtn)
+	} else {
+		continueBtn = m.styles.Muted.Render(continueBtn)
+		retryBtn = m.styles.Button.Render(retryBtn)
+	}
+
 	b.WriteString(continueBtn + "    " + retryBtn)
 
 	// Center everything

@@ -14,6 +14,10 @@ type Layout struct {
 	ContentWidth  int
 	ContentHeight int
 
+	// Split content area dimensions
+	InfoHeight     int // Upper area for scenario info
+	TerminalHeight int // Lower area for embedded terminal
+
 	// Header/Footer heights
 	HeaderHeight    int
 	StatusBarHeight int
@@ -63,12 +67,22 @@ func NewLayout(width, height int) Layout {
 	// Calculate content height (remove header, status bar, and borders)
 	contentHeight := height - HeaderHeight - StatusBarHeight - 4
 
+	// Calculate split content areas (40% info, 60% terminal)
+	mainAreaHeight := height - HeaderHeight - StatusBarHeight
+	infoHeight := mainAreaHeight * 40 / 100
+	if infoHeight < 8 {
+		infoHeight = 8 // Minimum height for info panel
+	}
+	terminalHeight := mainAreaHeight - infoHeight
+
 	return Layout{
 		Width:           width,
 		Height:          height,
 		SidebarWidth:    sidebarWidth,
 		ContentWidth:    contentWidth,
 		ContentHeight:   contentHeight,
+		InfoHeight:      infoHeight,
+		TerminalHeight:  terminalHeight,
 		HeaderHeight:    HeaderHeight,
 		StatusBarHeight: StatusBarHeight,
 	}

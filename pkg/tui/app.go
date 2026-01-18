@@ -25,6 +25,7 @@ type FocusArea int
 const (
 	FocusSidebar FocusArea = iota
 	FocusContent
+	FocusTerminal
 )
 
 // View represents the current TUI view.
@@ -36,6 +37,7 @@ const (
 	ViewDashboard
 	ViewScenarioRunning
 	ViewSuccess
+	ViewConfirmRestart
 )
 
 // AppModel is the main Bubbletea model with the new component architecture.
@@ -62,8 +64,12 @@ type AppModel struct {
 	header    components.HeaderModel
 	sidebar   components.SidebarModel
 	content   components.ContentModel
+	terminal  *components.TerminalModel
 	statusbar components.StatusBarModel
 	success   components.SuccessModel
+
+	// Kubeconfig path for terminal
+	kubeconfig string
 
 	// Scenario list (for dashboard)
 	scenarioList list.Model
@@ -73,6 +79,10 @@ type AppModel struct {
 	k8sClient      *k8s.Client
 	engineInstance *engine.Engine
 	registry       *scenario.Registry
+
+	// State
+	completedScenarios map[string]bool
+	confirmSelection   int // 0: Yes, 1: No
 
 	// Running scenario
 	currentScenario scenario.Scenario
@@ -119,21 +129,28 @@ func NewAppModel() AppModel {
 	s.Style = lipgloss.NewStyle().Foreground(theme.Primary)
 
 	return AppModel{
-		theme:         theme,
-		styles:        styles,
-		keymap:        keymap,
-		layout:        NewLayout(80, 24),
-		view:          ViewVersionSelect,
-		focus:         FocusSidebar,
-		versions:      cluster.SupportedVersions(),
-		checkInterval: 2 * time.Second,
-		header:        components.NewHeaderModel(),
-		sidebar:       components.NewSidebarModel(),
-		content:       components.NewContentModel(),
-		statusbar:     components.NewStatusBarModel(),
-		success:       components.NewSuccessModel(),
-		bootstrap:     components.NewProgressModel(),
+		theme:              theme,
+		styles:             styles,
+		keymap:             keymap,
+		layout:             NewLayout(80, 24),
+		view:               ViewVersionSelect,
+		focus:              FocusSidebar,
+		versions:           cluster.SupportedVersions(),
+		checkInterval:      2 * time.Second,
+		header:             components.NewHeaderModel(),
+		sidebar:            components.NewSidebarModel(),
+		content:            components.NewContentModel(),
+		terminal:           components.NewTerminalModel(),
+		statusbar:          components.NewStatusBarModel(),
+		success:            components.NewSuccessModel(),
+		bootstrap:          components.NewProgressModel(),
+		completedScenarios: make(map[string]bool),
 	}
+}
+
+// SetTerminalProgram sets the tea.Program reference on the terminal for async output refresh.
+func (m *AppModel) SetTerminalProgram(p *tea.Program) {
+	m.terminal.SetProgram(p)
 }
 
 // Init initializes the model.
@@ -151,16 +168,25 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// Global quit handling
-		if key.Matches(msg, m.keymap.Quit) && m.view != ViewBootstrap {
+		// Skip global quit if in terminal to allow shell interrupts
+		allowQuit := true
+		if m.view == ViewScenarioRunning && m.focus == FocusTerminal {
+			allowQuit = false
+		}
+
+		if allowQuit && key.Matches(msg, m.keymap.Quit) && m.view != ViewBootstrap {
 			m.quitting = true
 			return m, m.cleanup()
 		}
 
-		// Tab for focus switching
+		// Tab for focus switching (Sidebar → Content → Terminal → Sidebar)
 		if key.Matches(msg, m.keymap.Tab) && m.view == ViewScenarioRunning {
-			if m.focus == FocusSidebar {
+			switch m.focus {
+			case FocusSidebar:
 				m.focus = FocusContent
-			} else {
+			case FocusContent:
+				m.focus = FocusTerminal
+			case FocusTerminal:
 				m.focus = FocusSidebar
 			}
 			m.updateFocusStyles()
@@ -187,6 +213,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == ViewScenarioRunning {
 			return m, m.checkScenario()
 		}
+
+	case components.TerminalOutputMsg:
+		// Terminal has new output, just return to trigger re-render
+		return m, nil
 	}
 
 	// Handle view-specific updates
@@ -201,6 +231,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateScenarioRunning(msg)
 	case ViewSuccess:
 		return m.updateSuccess(msg)
+	case ViewConfirmRestart:
+		return m.updateConfirmRestart(msg)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -209,7 +241,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *AppModel) updateComponentSizes() {
 	m.header.SetWidth(m.width)
 	m.sidebar.SetSize(m.layout.SidebarWidth, m.layout.MainAreaHeight())
-	m.content.SetSize(m.layout.ContentWidth, m.layout.MainAreaHeight())
+	// Calculate split content areas manually to ensure correctness
+	mainH := m.layout.MainAreaHeight()
+	infoH := mainH * 40 / 100
+	if infoH < 8 {
+		infoH = 8
+	}
+	termH := mainH - infoH
+
+	// Content gets the info panel height (upper area)
+	m.content.SetSize(m.layout.ContentWidth, infoH)
+	// Terminal gets the terminal height (lower area)
+	m.terminal.SetSize(m.layout.ContentWidth, termH)
+
 	m.statusbar.SetWidth(m.width)
 	m.success.SetSize(m.width, m.height)
 	m.bootstrap.SetWidth(m.width)
@@ -218,6 +262,7 @@ func (m *AppModel) updateComponentSizes() {
 func (m *AppModel) updateFocusStyles() {
 	m.sidebar.SetFocus(m.focus == FocusSidebar)
 	m.content.SetFocus(m.focus == FocusContent)
+	m.terminal.SetFocus(m.focus == FocusTerminal)
 }
 
 func (m AppModel) handleBootstrapDone(msg bootstrapDoneMsg) (tea.Model, tea.Cmd) {
@@ -233,6 +278,8 @@ func (m AppModel) handleBootstrapDone(msg bootstrapDoneMsg) (tea.Model, tea.Cmd)
 		return m, nil
 	}
 	m.k8sClient = client
+	m.kubeconfig = msg.kubeconfig
+	m.terminal.SetKubeconfig(msg.kubeconfig)
 	m.registry = scenario.NewRegistry(client.Clientset)
 	m.engineInstance = engine.NewEngine(m.registry)
 
@@ -277,7 +324,7 @@ func (m *AppModel) buildSidebarItems() {
 					Title:       s.GetMetadata().Name,
 					Description: s.GetMetadata().Description,
 					Category:    cat,
-					Completed:   false,
+					Completed:   m.completedScenarios[s.GetMetadata().ID],
 				})
 			}
 			items = append(items, catItem)
@@ -298,7 +345,7 @@ func (m *AppModel) buildSidebarItems() {
 				Title:       s.GetMetadata().Name,
 				Description: s.GetMetadata().Description,
 				Category:    cat,
-				Completed:   false,
+				Completed:   m.completedScenarios[s.GetMetadata().ID],
 			})
 		}
 		items = append(items, catItem)
@@ -368,33 +415,18 @@ func (m AppModel) updateDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key.Matches(keyMsg, m.keymap.Enter) {
 			// Start selected scenario
 			if item := m.sidebar.SelectedItem(); item != nil && !item.IsCategory {
-				// Find scenario by ID
 				for _, s := range m.registry.List() {
 					if s.GetMetadata().ID == item.ID {
 						m.currentScenario = s
-						m.view = ViewScenarioRunning
-						m.header.SetTitle("🥋 " + s.GetMetadata().Name)
-						m.header.StartTimer()
 
-						// Setup content panel
-						m.content.SetScenario(
-							s.GetMetadata().Name,
-							s.GetMetadata().Description,
-							s.GetNamespace(),
-						)
-						m.content.SetCommands([]string{
-							fmt.Sprintf("kubectl config use-context kind-%s", cluster.ClusterName),
-							fmt.Sprintf("kubectl get pods -n %s", s.GetNamespace()),
-						})
-						m.content.SetHints(s.GetMetadata().Hints)
-						m.content.SetStatus("Investigating...", false)
+						// Check if already completed
+						if m.completedScenarios[s.GetMetadata().ID] {
+							m.view = ViewConfirmRestart
+							m.confirmSelection = 1 // Default to No (Safe)
+							return m, nil
+						}
 
-						return m, tea.Batch(
-							m.startScenario(),
-							tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
-								return tickMsg(t)
-							}),
-						)
+						return m.startSelectedScenario(s)
 					}
 				}
 			}
@@ -408,35 +440,44 @@ func (m AppModel) updateDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m AppModel) updateScenarioRunning(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		switch {
-		case key.Matches(keyMsg, m.keymap.Check):
-			return m, m.checkScenario()
-		case key.Matches(keyMsg, m.keymap.ToggleHints):
-			m.content.ToggleHints()
-		case key.Matches(keyMsg, m.keymap.NextHint):
-			m.content.NextHint()
-		case key.Matches(keyMsg, m.keymap.PrevHint):
-			m.content.PrevHint()
-		case key.Matches(keyMsg, m.keymap.Escape):
-			// Return to dashboard
-			ctx := context.Background()
-			if m.engineInstance != nil {
-				_ = m.engineInstance.Cleanup(ctx)
+		// Only handle shortcuts if NOT focused on terminal
+		if m.focus != FocusTerminal {
+			switch {
+			case key.Matches(keyMsg, m.keymap.Check):
+				return m, m.checkScenario()
+			case key.Matches(keyMsg, m.keymap.ToggleHints):
+				m.content.ToggleHints()
+			case key.Matches(keyMsg, m.keymap.NextHint):
+				m.content.NextHint()
+			case key.Matches(keyMsg, m.keymap.PrevHint):
+				m.content.PrevHint()
+			case key.Matches(keyMsg, m.keymap.Escape):
+				// Return to dashboard
+				ctx := context.Background()
+				if m.engineInstance != nil {
+					_ = m.engineInstance.Cleanup(ctx)
+				}
+				m.terminal.Stop()
+				m.header.SetTitle("🥋 K8s-Dojo")
+				m.header.ResetTimer()
+				m.view = ViewDashboard
+				m.currentScenario = nil
+				return m, nil
 			}
-			m.header.SetTitle("🥋 K8s-Dojo")
-			m.header.ResetTimer()
-			m.view = ViewDashboard
-			m.currentScenario = nil
-			return m, nil
 		}
 	}
 
 	// Update focused component
-	if m.focus == FocusSidebar {
+	switch m.focus {
+	case FocusSidebar:
 		var cmd tea.Cmd
 		m.sidebar, cmd = m.sidebar.Update(msg)
 		return m, cmd
-	} else {
+	case FocusTerminal:
+		var cmd tea.Cmd
+		cmd = m.terminal.Update(msg) // Terminal update returns cmd only, mutates state pointer
+		return m, cmd
+	default: // FocusContent
 		var cmd tea.Cmd
 		m.content, cmd = m.content.Update(msg)
 		return m, cmd
@@ -446,30 +487,69 @@ func (m AppModel) updateScenarioRunning(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m AppModel) updateSuccess(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch {
-		case key.Matches(keyMsg, m.keymap.Enter), key.Matches(keyMsg, m.keymap.ReturnMenu):
-			ctx := context.Background()
-			if m.engineInstance != nil {
-				_ = m.engineInstance.Cleanup(ctx)
-			}
-			m.header.SetTitle("🥋 K8s-Dojo")
-			m.header.ResetTimer()
-			m.view = ViewDashboard
-			m.currentScenario = nil
-			m.lastCheckResult = scenario.Result{}
+		// Navigation
+		case key.Matches(keyMsg, m.keymap.Left), key.Matches(keyMsg, m.keymap.ShiftTab), key.Matches(keyMsg, m.keymap.Up):
+			m.success.PrevButton()
 			return m, nil
+		case key.Matches(keyMsg, m.keymap.Right), key.Matches(keyMsg, m.keymap.Tab), key.Matches(keyMsg, m.keymap.Down):
+			m.success.NextButton()
+			return m, nil
+
+		case key.Matches(keyMsg, m.keymap.Enter):
+			if m.success.SelectedButton() == 1 {
+				// Retry
+				return m.handleRetry()
+			}
+			// Continue
+			return m.handleReturnToDashboard()
+
+		case key.Matches(keyMsg, m.keymap.ReturnMenu):
+			return m.handleReturnToDashboard()
+
 		case key.Matches(keyMsg, m.keymap.Retry):
-			// Restart same scenario
-			m.header.StartTimer()
-			m.view = ViewScenarioRunning
-			return m, tea.Batch(
-				m.startScenario(),
-				tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
-					return tickMsg(t)
-				}),
-			)
+			return m.handleRetry()
 		}
 	}
 	return m, nil
+}
+
+func (m AppModel) handleReturnToDashboard() (tea.Model, tea.Cmd) {
+	// Mark current scenario as completed
+	if m.currentScenario != nil {
+		m.completedScenarios[m.currentScenario.GetMetadata().ID] = true
+	}
+
+	ctx := context.Background()
+	if m.engineInstance != nil {
+		_ = m.engineInstance.Cleanup(ctx)
+	}
+
+	m.header.SetTitle("🥋 K8s-Dojo")
+	m.header.ResetTimer()
+
+	// Refresh sidebar to show updated status
+	m.buildSidebarItems()
+
+	m.view = ViewDashboard
+	m.focus = FocusSidebar // Explicitly set focus to Sidebar
+	m.updateFocusStyles()  // Apply focus styles
+
+	m.currentScenario = nil
+	m.lastCheckResult = scenario.Result{}
+
+	return m, nil
+}
+
+func (m AppModel) handleRetry() (tea.Model, tea.Cmd) {
+	// Restart same scenario
+	m.header.StartTimer()
+	m.view = ViewScenarioRunning
+	return m, tea.Batch(
+		m.startScenario(),
+		tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		}),
+	)
 }
 
 // Commands
@@ -489,8 +569,39 @@ func (m AppModel) startScenario() tea.Cmd {
 		if err != nil {
 			return checkResultMsg{result: scenario.Result{Solved: false, Message: err.Error()}}
 		}
-		return checkResultMsg{result: scenario.Result{Solved: false, Message: "Scenario started. Open another terminal and use kubectl to investigate!"}}
+		return checkResultMsg{result: scenario.Result{Solved: false, Message: "Scenario started. Use kubectl in the terminal below to investigate!"}}
 	}
+}
+
+func (m AppModel) startSelectedScenario(s scenario.Scenario) (tea.Model, tea.Cmd) {
+	m.view = ViewScenarioRunning
+	m.header.SetTitle("🥋 " + s.GetMetadata().Name)
+	m.header.StartTimer()
+
+	// Setup content panel
+	m.content.SetScenario(
+		s.GetMetadata().Name,
+		s.GetMetadata().Description,
+		s.GetNamespace(),
+	)
+	m.content.SetCommands([]string{
+		fmt.Sprintf("kubectl config use-context kind-%s", cluster.ClusterName),
+		fmt.Sprintf("kubectl get pods -n %s", s.GetNamespace()),
+	})
+	m.content.SetHints(s.GetMetadata().Hints)
+	m.content.SetStatus("Investigating...", false)
+
+	// Auto-focus terminal for immediate input
+	m.focus = FocusTerminal
+	m.updateFocusStyles()
+
+	return m, tea.Batch(
+		m.startScenario(),
+		m.terminal.Start(),
+		tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		}),
+	)
 }
 
 func (m AppModel) checkScenario() tea.Cmd {
@@ -538,6 +649,8 @@ func (m AppModel) View() string {
 		return m.viewScenarioRunning()
 	case ViewSuccess:
 		return m.viewSuccess()
+	case ViewConfirmRestart:
+		return m.viewConfirmRestart()
 	}
 
 	return ""
@@ -603,10 +716,10 @@ func (m AppModel) viewDashboard() string {
 	// Main area: Sidebar + Content (but in dashboard, we show list in content area)
 	sidebar := m.sidebar.View()
 
-	// For dashboard, content shows selected item preview or instructions
+	// For dashboard, content shows selected item preview or instructions (top 40%)
 	contentStyle := m.styles.Content.
 		Width(m.layout.ContentWidth - 2).
-		Height(m.layout.MainAreaHeight() - 2)
+		Height(m.layout.InfoHeight - 2)
 
 	var contentText string
 	if item := m.sidebar.SelectedItem(); item != nil && !item.IsCategory {
@@ -621,8 +734,12 @@ func (m AppModel) viewDashboard() string {
 	}
 	content := contentStyle.Render(contentText)
 
-	// Join sidebar and content horizontally
-	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, content)
+	// In dashboard, we also show the terminal panel to maintain layout consistency
+	terminal := m.terminal.View()
+	rightSide := lipgloss.JoinVertical(lipgloss.Left, content, terminal)
+
+	// Join sidebar and right side
+	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, rightSide)
 
 	// Status bar
 	m.statusbar.SetKeys(components.ContextualStatusBar("scenario-select"))
@@ -638,8 +755,12 @@ func (m AppModel) viewScenarioRunning() string {
 	// Main area: Sidebar + Content
 	sidebar := m.sidebar.View()
 	content := m.content.View()
+	terminal := m.terminal.View()
 
-	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, content)
+	// Right side is content (top) + terminal (bottom)
+	rightSide := lipgloss.JoinVertical(lipgloss.Left, content, terminal)
+
+	mainArea := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, rightSide)
 
 	// Status bar
 	m.statusbar.SetKeys(components.ContextualStatusBar("scenario-running"))
@@ -650,4 +771,66 @@ func (m AppModel) viewScenarioRunning() string {
 
 func (m AppModel) viewSuccess() string {
 	return m.success.View()
+}
+
+func (m AppModel) updateConfirmRestart(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch {
+		// Navigation
+		case key.Matches(keyMsg, m.keymap.Left), key.Matches(keyMsg, m.keymap.ShiftTab), key.Matches(keyMsg, m.keymap.Up):
+			m.confirmSelection = (m.confirmSelection - 1 + 2) % 2
+			return m, nil
+		case key.Matches(keyMsg, m.keymap.Right), key.Matches(keyMsg, m.keymap.Tab), key.Matches(keyMsg, m.keymap.Down):
+			m.confirmSelection = (m.confirmSelection + 1) % 2
+			return m, nil
+
+		case key.Matches(keyMsg, m.keymap.Enter):
+			if m.confirmSelection == 0 {
+				return m.startSelectedScenario(m.currentScenario)
+			}
+			// Cancel
+			m.view = ViewDashboard
+			m.currentScenario = nil
+			return m, nil
+
+		case key.Matches(keyMsg, m.keymap.Escape), key.Matches(keyMsg, m.keymap.Quit):
+			// Cancel
+			m.view = ViewDashboard
+			m.currentScenario = nil
+			return m, nil
+		// Allow 'y' and 'n' as distinct from general keymap
+		case keyMsg.String() == "y":
+			return m.startSelectedScenario(m.currentScenario)
+		case keyMsg.String() == "n":
+			m.view = ViewDashboard
+			m.currentScenario = nil
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m AppModel) viewConfirmRestart() string {
+	// Re-use success styles for consistent look, or simpler box
+	title := m.styles.Title.Render("⚠️  Restart Scenario?")
+
+	msg := fmt.Sprintf("\nYou have already completed\n'%s'.\n\nRestarting will reset the environment.\nAre you sure?\n", m.currentScenario.GetMetadata().Name)
+
+	yesBtn := "[ Yes (y) ]"
+	noBtn := "[ No (n) ]"
+
+	if m.confirmSelection == 0 {
+		yesBtn = m.styles.ActiveItem.Render(yesBtn)
+		noBtn = m.styles.TextMuted.Render(noBtn)
+	} else {
+		yesBtn = m.styles.TextMuted.Render(yesBtn)
+		noBtn = m.styles.ActiveItem.Render(noBtn)
+	}
+
+	buttons := yesBtn + "    " + noBtn
+
+	boxStyle := m.styles.Box.Width(50).Align(lipgloss.Center).BorderForeground(lipgloss.Color("#fab387")) // Peach/Orange for warning
+	boxContent := title + "\n" + m.styles.Text.Render(msg) + "\n" + buttons
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, boxStyle.Render(boxContent))
 }
