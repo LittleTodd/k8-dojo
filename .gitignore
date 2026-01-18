@@ -1,7 +1,7 @@
 # Binaries
-k8s-dojo
-k8s-dojo.exe
-k8s-dojo-test
+/k8s-dojo
+/k8s-dojo.exe
+/k8s-dojo-test
 *.test
 *.out
 
@@ -10,7 +10,11 @@ k8s-dojo-test
 .idea/
 *.swp
 *.swo
-.gitignore
+
+# Go
+vendor/
+go.work
+go.work.sum
 
 # OS
 .DS_Store
