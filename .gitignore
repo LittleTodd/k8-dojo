@@ -10,6 +10,7 @@ k8s-dojo-test
 .idea/
 *.swp
 *.swo
+.gitignore
 
 # OS
 .DS_Store

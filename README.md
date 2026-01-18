@@ -10,10 +10,11 @@
 
 ## 🚀 Features
 
-*   **31+ Real-World Scenarios**: Curated from production outages and expert interviews.
-*   **Interactive TUI**: A beautiful Terminal User Interface (Bubbletea) to navigate and manage your training.
+*   **30 Real-World Scenarios**: Curated from production outages and expert interviews.
+*   **Interactive TUI**: A beautiful Terminal User Interface (Bubbletea) with **adaptive theming** (Light/Dark modes).
+*   **Smart Terminal**: Embedded terminal with **syntax highlighting** (Vim/YAML) for a better editing experience.
 *   **Real-Time Validation**: Instant feedback loop. Fix the issue, press `c` to check, and get immediate results.
-*   **Safe Playground**: Uses [Kind](https://kind.sigs.k8s.io) to spin up disposable local clusters. Break things without fear.
+*   **Safe Playground**: Uses [Kind](https://kind.sigs.k8s.io) to spin up disposable local clusters. Includes **restart safeguards** to prevent accidental progress loss.
 *   **Categorized Modules**: Targeted training in Networking, Security, Lifecycle, Storage, and Ops.
 *   **Hints System**: Stuck? Toggle hints to get nudged in the right direction.
 
@@ -74,9 +75,13 @@ go build -o k8s-dojo ./cmd/k8s-dojo
     *   Back in the TUI, press `c` to check your solution.
     *   If solved, celebrate! 🎉 Then press `Enter` to return to the menu.
 
+6.  **Replay**:
+    *   Select a completed scenario again to challenge yourself.
+    *   **Safeguard**: You will be asked to confirm before restarting to prevent accidental progress resets.
+
 ---
 
-## 🧩 Scenario Arsenal (31 Levels)
+## 🧩 Scenario Arsenal (30 Levels)
 
 ### 🌐 Networking Module
 *   **Service Discovery**: Fix Service selectors (`net-service-selector`).
