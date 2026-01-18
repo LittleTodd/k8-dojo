@@ -1,0 +1,29 @@
+# Binaries
+k8s-dojo
+k8s-dojo.exe
+k8s-dojo-test
+*.test
+*.out
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and Temp
+*.log
+tmp/
+coverage.out
+
+# Kubernetes Config (Safety)
+*.kubeconfig
+config
+
+# Internal Documentation
+plan.md
+K8s_The_Complete_Detective_Mastery_Full_V2.md
