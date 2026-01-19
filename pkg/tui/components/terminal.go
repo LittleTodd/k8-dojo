@@ -133,6 +133,7 @@ func (m *TerminalModel) Start() tea.Cmd {
 			"KUBE_EDITOR=vim -c 'syntax on'", // Force vim with syntax highlighting for kubectl
 			"EDITOR=vim",                     // Default editor
 			"VIMINIT=syntax on",              // Ensure syntax is on for direct vim usage
+			"PROMPT_EOL_MARK=",               // Suppress Zsh partial line indicator (%)
 		)
 
 		// Add kubeconfig if set
@@ -178,7 +179,8 @@ func (m *TerminalModel) Start() tea.Cmd {
 
 		// Write specific Welcome message to specific VTE
 		// Note: We can write to VTE directly, bypassing PTY echo if we want
-		fmt.Fprintln(m.term, "Terminal ready. Use kubectl commands below:")
+		// Use \r\n to ensure cursor returns to column 0, preventing Zsh % indicator
+		fmt.Fprint(m.term, "Terminal ready. Use kubectl commands below:\r\n")
 
 		// Start reading output in background
 		m.wg.Add(1)

@@ -78,6 +78,10 @@ go build -o k8s-dojo ./cmd/k8s-dojo
 6.  **Replay**:
     *   Select a completed scenario again to challenge yourself.
     *   **Safeguard**: You will be asked to confirm before restarting to prevent accidental progress resets.
+82: 
+83: 7.  **Exit**:
+84:     *   Press `q` or `Ctrl+C` at any time to exit.
+85:     *   **Safeguard**: To prevent accidental quitting, a confirmation dialog will appear if you are on the dashboard.
 
 ---
 

@@ -48,18 +48,16 @@ func (m *Manager) EnsureCluster(version SupportedVersion) (string, error) {
 	}
 
 	if !exists {
-		fmt.Printf("Creating cluster %s with Kubernetes %s...\n", ClusterName, version.Version)
 		err = m.provider.Create(
 			ClusterName,
 			cluster.CreateWithNodeImage(version.NodeImage),
 			cluster.CreateWithWaitForReady(0), // Wait indefinitely for cluster to be ready
+			cluster.CreateWithDisplayUsage(false),
+			cluster.CreateWithDisplaySalutation(false),
 		)
 		if err != nil {
 			return "", fmt.Errorf("failed to create cluster: %w", err)
 		}
-		fmt.Println("Cluster created successfully!")
-	} else {
-		fmt.Printf("Cluster %s already exists.\n", ClusterName)
 	}
 
 	// Get kubeconfig (in-memory)

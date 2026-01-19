@@ -47,6 +47,11 @@ func (e *Engine) StartScenario(ctx context.Context, id string) error {
 		return fmt.Errorf("scenario not found: %s", id)
 	}
 
+	// Ensure clean slate by cleaning up any previous state
+	fmt.Printf("Ensuring clean state for scenario: %s\n", s.GetMetadata().Name)
+	// We ignore the error here because it's likely "not found" if the scenario wasn't running
+	_ = s.Cleanup(ctx)
+
 	// Setup the scenario
 	fmt.Printf("Setting up scenario: %s\n", s.GetMetadata().Name)
 	if err := s.Setup(ctx); err != nil {

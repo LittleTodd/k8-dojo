@@ -16,6 +16,7 @@ import (
 	"k8s-dojo/pkg/engine"
 	"k8s-dojo/pkg/k8s"
 	"k8s-dojo/pkg/scenario"
+	"k8s-dojo/pkg/state"
 	"k8s-dojo/pkg/tui/components"
 )
 
@@ -38,6 +39,7 @@ const (
 	ViewScenarioRunning
 	ViewSuccess
 	ViewConfirmRestart
+	ViewConfirmQuit
 )
 
 // AppModel is the main Bubbletea model with the new component architecture.
@@ -49,8 +51,9 @@ type AppModel struct {
 	layout Layout
 
 	// Current view and focus
-	view  View
-	focus FocusArea
+	view         View
+	previousView View
+	focus        FocusArea
 
 	// Version selection
 	versions        []cluster.SupportedVersion
@@ -81,6 +84,7 @@ type AppModel struct {
 	k8sClient      *k8s.Client
 	engineInstance *engine.Engine
 	registry       *scenario.Registry
+	stateManager   *state.Manager
 
 	// State
 	completedScenarios map[string]bool
@@ -160,10 +164,8 @@ func (m *AppModel) SetTerminalProgram(p *tea.Program) {
 
 // Init initializes the model.
 func (m AppModel) Init() tea.Cmd {
-	return tea.Batch(
-		tea.EnterAltScreen,
-		m.bootstrap.Init(),
-	)
+	// Note: Don't call tea.EnterAltScreen here since main.go uses tea.WithAltScreen()
+	return m.bootstrap.Init()
 }
 
 // Update handles messages.
@@ -179,9 +181,23 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			allowQuit = false
 		}
 
-		if allowQuit && key.Matches(msg, m.keymap.Quit) && m.view != ViewBootstrap {
-			m.quitting = true
-			return m, m.cleanup()
+		if allowQuit && key.Matches(msg, m.keymap.Quit) {
+			// Bootstrap: Immediate quit
+			if m.view == ViewBootstrap {
+				m.quitting = true
+				return m, m.cleanup()
+			}
+
+			// If already in a confirmation/dialog view, let that view handle the key (usually cancel)
+			if m.view == ViewConfirmQuit || m.view == ViewConfirmRestart {
+				// Fall through to view-specific update
+			} else {
+				// For all other views, show confirmation
+				m.previousView = m.view // Remember where we came from
+				m.view = ViewConfirmQuit
+				m.confirmSelection = 1 // Default to No
+				return m, nil
+			}
 		}
 
 		// Tab for focus switching (Sidebar → Content → Terminal → Sidebar)
@@ -235,22 +251,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Advance step
-			// Mark current step complete (if not the first run)
+			// Mark previous step as complete (the one that was active)
 			if m.bootstrapStep > 0 && m.bootstrapStep-1 < len(steps) {
 				steps[m.bootstrapStep-1].Complete = true
 				steps[m.bootstrapStep-1].Active = false
 			}
 
-			// Mark next step active
-			if m.bootstrapStep < len(steps) {
-				steps[m.bootstrapStep].Active = true
-			}
+			// Mark current step as active
+			steps[m.bootstrapStep].Active = true
 
 			m.bootstrap.SetSteps(steps)
 
-			// Smooth progress increment
-			pct := float64(m.bootstrapStep+1) * (1.0 / float64(len(steps)+1))
+			// Calculate progress as percentage of completed steps
+			// bootstrapStep is the current step (0-indexed), so (bootstrapStep+1)/total
+			pct := float64(m.bootstrapStep+1) / float64(len(steps))
 			m.bootstrap.SetPercent(pct)
 
 			m.bootstrapStep++
@@ -259,6 +273,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case finalDelayMsg:
 		return m.finalizeBootstrap()
+
+	case scenarioStartedMsg:
+		if msg.err != nil {
+			m.content.SetStatus(fmt.Sprintf("Failed to start scenario: %v", msg.err), false)
+			return m, nil
+		}
+		m.content.SetStatus("Scenario started. Use kubectl in the terminal below to investigate!", false)
+		return m, tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		})
 
 	case components.TerminalOutputMsg:
 		// Terminal has new output, just return to trigger re-render
@@ -279,6 +303,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateSuccess(msg)
 	case ViewConfirmRestart:
 		return m.updateConfirmRestart(msg)
+	case ViewConfirmQuit:
+		return m.updateConfirmQuit(msg)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -328,6 +354,14 @@ func (m AppModel) handleBootstrapDone(msg bootstrapDoneMsg) (tea.Model, tea.Cmd)
 	m.terminal.SetKubeconfig(msg.kubeconfig)
 	m.registry = scenario.NewRegistry(client.Clientset)
 	m.engineInstance = engine.NewEngine(m.registry)
+
+	// Initialize state manager and load state
+	m.stateManager, err = state.NewManager("")
+	if err == nil {
+		if st, err := m.stateManager.Load(); err == nil {
+			m.completedScenarios = st.CompletedScenarios
+		}
+	}
 
 	// Build sidebar items from categories
 	m.buildSidebarItems()
@@ -435,6 +469,12 @@ func (m AppModel) handleCheckResult(msg checkResultMsg) (tea.Model, tea.Cmd) {
 		m.content.SetStatus(msg.result.Message, msg.result.Solved)
 
 		if msg.result.Solved {
+			// Persist completion state
+			if m.stateManager != nil {
+				_ = m.stateManager.MarkScenarioCompleted(m.currentScenario.GetMetadata().ID)
+			}
+			m.completedScenarios[m.currentScenario.GetMetadata().ID] = true
+
 			m.success.SetScenario(m.currentScenario.GetMetadata().Name)
 			m.success.SetMessage(msg.result.Message)
 			m.success.SetElapsedTime(elapsed)
@@ -462,16 +502,21 @@ func (m AppModel) updateVersionSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(keyMsg, m.keymap.Enter):
 			m.view = ViewBootstrap
 			m.bootstrap.SetTitle("Preparing Training Environment")
-			m.bootstrap.SetSubtitle(fmt.Sprintf("Creating Kind cluster (v%s)...", m.versions[m.selectedVersion].Version))
-			m.bootstrap.SetSteps([]components.ProgressStep{
+			m.bootstrap.SetSubtitle(fmt.Sprintf("Creating Kind cluster (%s)...", m.versions[m.selectedVersion].Version))
+			// Define steps - first two are already complete
+			steps := []components.ProgressStep{
 				{Label: "Docker detected", Complete: true},
 				{Label: "Kind installed", Complete: true},
 				{Label: "Pulling node image", Active: true},
-				{Label: "Starting control plane", Complete: false},
-				{Label: "Configuring kubeconfig", Complete: false},
-			})
-			m.bootstrap.SetPercent(0.1)
-			m.bootstrapStep = 0 // Start from beginning
+				{Label: "Starting control plane"},
+				{Label: "Configuring kubeconfig"},
+			}
+			m.bootstrap.SetSteps(steps)
+			// Start from step 2 (0-indexed) since first two steps are complete
+			// This means bootstrapStep represents the NEXT step to process
+			m.bootstrapStep = 2
+			// Initial percent: step 2 out of 5 steps = ~33%
+			m.bootstrap.SetPercent(float64(m.bootstrapStep) / float64(len(steps)))
 			return m, tea.Batch(
 				m.doBootstrap(),
 				m.tickProgress(),
@@ -639,14 +684,15 @@ func (m AppModel) doBootstrap() tea.Cmd {
 	}
 }
 
+type scenarioStartedMsg struct {
+	err error
+}
+
 func (m AppModel) startScenario() tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 		err := m.engineInstance.StartScenario(ctx, m.currentScenario.GetMetadata().ID)
-		if err != nil {
-			return checkResultMsg{result: scenario.Result{Solved: false, Message: err.Error()}}
-		}
-		return checkResultMsg{result: scenario.Result{Solved: false, Message: "Scenario started. Use kubectl in the terminal below to investigate!"}}
+		return scenarioStartedMsg{err: err}
 	}
 }
 
@@ -666,7 +712,7 @@ func (m AppModel) startSelectedScenario(s scenario.Scenario) (tea.Model, tea.Cmd
 		fmt.Sprintf("kubectl get pods -n %s", s.GetNamespace()),
 	})
 	m.content.SetHints(s.GetMetadata().Hints)
-	m.content.SetStatus("Investigating...", false)
+	m.content.SetStatus("Setting up scenario environment...", false)
 
 	// Auto-focus terminal for immediate input
 	m.focus = FocusTerminal
@@ -675,9 +721,9 @@ func (m AppModel) startSelectedScenario(s scenario.Scenario) (tea.Model, tea.Cmd
 	return m, tea.Batch(
 		m.startScenario(),
 		m.terminal.Start(),
-		tea.Tick(m.checkInterval, func(t time.Time) tea.Msg {
-			return tickMsg(t)
-		}),
+		// Note: We DO NOT start the check ticker here.
+		// The check ticker will be started by handleCheckResult when startScenario completes.
+		// This prevents "no scenario is running" errors if checking happens before start finishes.
 	)
 }
 
@@ -734,6 +780,8 @@ func (m AppModel) View() string {
 		return m.viewSuccess()
 	case ViewConfirmRestart:
 		return m.viewConfirmRestart()
+	case ViewConfirmQuit:
+		return m.viewConfirmQuit()
 	}
 
 	return ""
@@ -762,8 +810,13 @@ func (m AppModel) viewVersionSelect() string {
 		options += cursor + label + "\n"
 	}
 
-	boxStyle := m.styles.Box.Width(30).Align(lipgloss.Center)
-	boxContent := m.styles.Subtitle.Render("Select Kubernetes Version") + "\n\n" + options
+	boxStyle := m.styles.Box.Width(30).Align(lipgloss.Left)
+
+	// Manually center the title since the box is now left-aligned
+	titleText := m.styles.Subtitle.Render("Select Kubernetes Version")
+	centeredTitle := lipgloss.PlaceHorizontal(26, lipgloss.Center, titleText)
+
+	boxContent := centeredTitle + "\n\n" + options
 
 	content = lipgloss.JoinVertical(lipgloss.Center,
 		title,
@@ -913,6 +966,68 @@ func (m AppModel) viewConfirmRestart() string {
 	buttons := yesBtn + "    " + noBtn
 
 	boxStyle := m.styles.Box.Width(50).Align(lipgloss.Center).BorderForeground(lipgloss.Color("#fab387")) // Peach/Orange for warning
+	boxContent := title + "\n" + m.styles.Text.Render(msg) + "\n" + buttons
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, boxStyle.Render(boxContent))
+}
+
+func (m AppModel) updateConfirmQuit(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch {
+		// Navigation
+		case key.Matches(keyMsg, m.keymap.Left), key.Matches(keyMsg, m.keymap.ShiftTab), key.Matches(keyMsg, m.keymap.Up):
+			m.confirmSelection = (m.confirmSelection - 1 + 2) % 2
+			return m, nil
+		case key.Matches(keyMsg, m.keymap.Right), key.Matches(keyMsg, m.keymap.Tab), key.Matches(keyMsg, m.keymap.Down):
+			m.confirmSelection = (m.confirmSelection + 1) % 2
+			return m, nil
+
+		case key.Matches(keyMsg, m.keymap.Enter):
+			if m.confirmSelection == 0 {
+				// Yes, quit
+				m.quitting = true
+				return m, m.cleanup()
+			}
+			// Cancel
+			m.view = ViewDashboard
+			return m, nil
+
+		case key.Matches(keyMsg, m.keymap.Escape), key.Matches(keyMsg, m.keymap.Quit):
+			// Cancel
+			m.view = m.previousView
+			return m, nil
+
+		// Allow 'y' and 'n'
+		case keyMsg.String() == "y":
+			m.quitting = true
+			return m, m.cleanup()
+		case keyMsg.String() == "n":
+			m.view = m.previousView
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m AppModel) viewConfirmQuit() string {
+	title := m.styles.Title.Render("👋  Quit K8s-Dojo?")
+
+	msg := "\nAre you sure you want to exit?\n"
+
+	yesBtn := "[ Yes (y) ]"
+	noBtn := "[ No (n) ]"
+
+	if m.confirmSelection == 0 {
+		yesBtn = m.styles.ActiveItem.Render(yesBtn)
+		noBtn = m.styles.TextMuted.Render(noBtn)
+	} else {
+		yesBtn = m.styles.TextMuted.Render(yesBtn)
+		noBtn = m.styles.ActiveItem.Render(noBtn)
+	}
+
+	buttons := yesBtn + "    " + noBtn
+
+	boxStyle := m.styles.Box.Width(40).Align(lipgloss.Center).BorderForeground(lipgloss.Color("#fab387"))
 	boxContent := title + "\n" + m.styles.Text.Render(msg) + "\n" + buttons
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, boxStyle.Render(boxContent))

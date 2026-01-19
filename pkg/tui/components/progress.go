@@ -92,8 +92,9 @@ func NewProgressModel() ProgressModel {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(accent)
 
+	// Use solid fill to improve rendering stability and avoid gradient artifacts
 	p := progress.New(
-		progress.WithDefaultGradient(),
+		progress.WithSolidFill("#8839ef"),
 		progress.WithWidth(40),
 		progress.WithoutPercentage(),
 	)
@@ -130,9 +131,13 @@ func (m *ProgressModel) SetSteps(steps []ProgressStep) {
 	m.steps = steps
 }
 
-// GetSteps returns the progress steps.
+// GetSteps returns a copy of the progress steps.
 func (m *ProgressModel) GetSteps() []ProgressStep {
-	return m.steps
+	copy := make([]ProgressStep, len(m.steps))
+	for i, s := range m.steps {
+		copy[i] = s
+	}
+	return copy
 }
 
 // SetWidth sets the width.
@@ -145,15 +150,13 @@ func (m *ProgressModel) SetWidth(width int) {
 }
 
 // Update handles spinner ticks.
+// Note: We intentionally DO NOT handle progress.FrameMsg here because we are using
+// ViewAs() for static rendering based on manual percentage updates.
 func (m ProgressModel) Update(msg tea.Msg) (ProgressModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
-	case progress.FrameMsg:
-		progressModel, cmd := m.progress.Update(msg)
-		m.progress = progressModel.(progress.Model)
 		return m, cmd
 	}
 	return m, nil
@@ -169,9 +172,14 @@ func (m ProgressModel) View() string {
 		b.WriteString("\n\n")
 	}
 
-	// Progress bar
-	b.WriteString(m.progress.ViewAs(m.percent))
-	b.WriteString(fmt.Sprintf(" %.0f%%", m.percent*100))
+	// Progress bar - sanitize to ensure no newlines
+	barRaw := m.progress.ViewAs(m.percent)
+	barRaw = strings.ReplaceAll(barRaw, "\n", "")
+	percentage := fmt.Sprintf(" %.0f%%", m.percent*100)
+
+	// Force horizontal layout to prevent splitting
+	barLine := lipgloss.JoinHorizontal(lipgloss.Center, barRaw, percentage)
+	b.WriteString(barLine)
 	b.WriteString("\n\n")
 
 	// Spinner + Subtitle
