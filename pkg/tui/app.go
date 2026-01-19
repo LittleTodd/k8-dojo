@@ -718,6 +718,9 @@ func (m AppModel) startSelectedScenario(s scenario.Scenario) (tea.Model, tea.Cmd
 	m.focus = FocusTerminal
 	m.updateFocusStyles()
 
+	// Reset terminal to clear previous state
+	m.terminal.Stop()
+
 	return m, tea.Batch(
 		m.startScenario(),
 		m.terminal.Start(),
